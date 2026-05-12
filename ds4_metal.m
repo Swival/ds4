@@ -594,18 +594,25 @@ static id<MTLBuffer> ds4_gpu_new_transient_buffer(NSUInteger bytes, const char *
     return buffer;
 }
 
+static int ds4_gpu_use_m5_simdgroup_matrix(void);
+
 static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_pipeline(
         const char *function_name,
         bool        bc_inp,
         bool        bc_out) {
-    NSString *key = [NSString stringWithFormat:@"%s_bci=%d_bco=%d",
-                     function_name, bc_inp ? 1 : 0, bc_out ? 1 : 0];
+    bool m5_sgmatrix = ds4_gpu_use_m5_simdgroup_matrix() != 0;
+    NSString *key = [NSString stringWithFormat:@"%s_bci=%d_bco=%d_m5sg=%d",
+                     function_name,
+                     bc_inp ? 1 : 0,
+                     bc_out ? 1 : 0,
+                     m5_sgmatrix ? 1 : 0];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) return cached;
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&bc_inp type:MTLDataTypeBool atIndex:700];
     [constants setConstantValue:&bc_out type:MTLDataTypeBool atIndex:701];
+    [constants setConstantValue:&m5_sgmatrix type:MTLDataTypeBool atIndex:702];
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -633,13 +640,17 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_pipeline(
 static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_id_pipeline(
         const char *function_name,
         bool        bc_inp) {
-    NSString *key = [NSString stringWithFormat:@"%s_bci=%d",
-                     function_name, bc_inp ? 1 : 0];
+    bool m5_sgmatrix = ds4_gpu_use_m5_simdgroup_matrix() != 0;
+    NSString *key = [NSString stringWithFormat:@"%s_bci=%d_m5sg=%d",
+                     function_name,
+                     bc_inp ? 1 : 0,
+                     m5_sgmatrix ? 1 : 0];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) return cached;
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&bc_inp type:MTLDataTypeBool atIndex:700];
+    [constants setConstantValue:&m5_sgmatrix type:MTLDataTypeBool atIndex:702];
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -902,6 +913,18 @@ static void ds4_gpu_detect_metal4_features(void) {
         }
     }
 #endif
+}
+
+static int ds4_gpu_use_m5_simdgroup_matrix(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        int disable = ds4_gpu_env_bool("DS4_METAL_DISABLE_M5_SIMDGROUP_MATRIX");
+        int force = ds4_gpu_env_bool("DS4_METAL_FORCE_M5_SIMDGROUP_MATRIX");
+        enabled = disable > 0 ? 0 : (force > 0 ? 1 : ds4_gpu_device_name_contains("M5"));
+        initialized = 1;
+    }
+    return enabled;
 }
 
 static int ds4_gpu_warm_model_views(void) {
@@ -1417,6 +1440,7 @@ static const char *ds4_gpu_source =
 "#define N_SG_Q8_0 4\n"
 "#define FC_MUL_MV 600\n"
 "#define FC_MUL_MM 700\n"
+"#define FC_MUL_MM_M5_SGMATRIX 702\n"
 "#define FC_BIN 1300\n"
 "#define FOR_UNROLL(x) _Pragma(\"clang loop unroll(full)\") for (x)\n"
 "#define M_PI_F 3.14159265358979323846f\n"
