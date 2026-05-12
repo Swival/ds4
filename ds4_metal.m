@@ -325,15 +325,11 @@ static int ds4_gpu_ensure_scratch_buffer(
     if (bytes > NSUIntegerMax) return 0;
 
     MTLResourceOptions options = MTLResourceStorageModeShared;
-    if (ds4_gpu_use_m5_private_scratch() &&
-        !ds4_gpu_scratch_needs_cpu_access(label)) {
+    if (ds4_gpu_use_m5_private_scratch() && !ds4_gpu_scratch_needs_cpu_access(label)) {
         /*
-         * M5 scratch buffers that only flow between Metal kernels do not need
-         * CPU-visible shared storage. This reduces shared-memory traffic and
-         * residency pressure for the long prefill scratch pools without
-         * changing the public buffer lifetime model. Keep default hazard
-         * tracking because the graph reuses these buffers across dependent
-         * compute encoders.
+         * Keep Metal's default hazard tracking. These scratch buffers are
+         * reused by dependent kernels across many compute encoders, and the
+         * graph does not insert explicit fences for untracked resources.
          */
         options = MTLResourceStorageModePrivate;
     }
