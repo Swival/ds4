@@ -302,7 +302,8 @@ static int ds4_gpu_use_m5_private_scratch(void) {
     static int initialized;
     static int enabled;
     if (!initialized) {
-        enabled = ds4_gpu_device_name_contains("M5");
+        enabled = getenv("DS4_METAL_DISABLE_M5_PRIVATE_SCRATCH") == NULL &&
+                  ds4_gpu_device_name_contains("M5");
         initialized = 1;
     }
     return enabled;
