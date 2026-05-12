@@ -1,7 +1,8 @@
 # DwarfStar 4
 
-**Apple M5 note:** this fork includes an M5-specific `metal_simdgroup_matrix`
-optimization for dense prefill and routed-MoE matmul kernels.
+**Apple M5 note:** this fork includes M5-specific `metal_simdgroup_matrix`
+optimization for dense prefill/routed-MoE matmul kernels and GPU-private
+scratch buffers for hot Metal intermediates.
 
 DwarfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
