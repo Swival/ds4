@@ -68,11 +68,19 @@ struct linenoiseState {
     size_t len;         /* Current edited line length. */
     size_t cols;        /* Number of columns in terminal. */
     size_t oldrows;     /* Rows used by last refreshed line (multiline mode) */
+    size_t oldstatusrows; /* Extra status rows used by last refresh. */
     int oldrpos;        /* Cursor row from last refresh (for multiline clearing). */
     int history_index;  /* The history index we are currently editing. */
     int fold_count;    /* Number of folded ranges. */
     size_t fold_start[LINENOISE_MAX_FOLDS]; /* Folded range start offsets. */
     size_t fold_end[LINENOISE_MAX_FOLDS];   /* Folded range end offsets. */
+    char *status;       /* Optional one-line status rendered below the prompt. */
+    char *status_start; /* Optional escape sequence emitted before status. */
+    char *status_end;   /* Optional escape sequence emitted after status. */
+    char *queued_input; /* Bytes already read by an outer event loop. */
+    size_t queued_input_len;
+    size_t queued_input_pos;
+    size_t queued_input_cap;
 };
 
 typedef struct linenoiseCompletions {
@@ -83,6 +91,11 @@ typedef struct linenoiseCompletions {
 /* Non blocking API. */
 int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, char *buf, size_t buflen, const char *prompt);
 char *linenoiseEditFeed(struct linenoiseState *l);
+char *linenoiseEditFeedByte(struct linenoiseState *l, char c);
+int linenoiseEditQueueInput(struct linenoiseState *l, const char *buf, size_t len);
+size_t linenoiseEditQueuedInput(struct linenoiseState *l);
+int linenoiseEditSetStatus(struct linenoiseState *l, const char *status,
+                           const char *start_escape, const char *end_escape);
 void linenoiseEditStop(struct linenoiseState *l);
 void linenoiseHide(struct linenoiseState *l);
 void linenoiseShow(struct linenoiseState *l);
