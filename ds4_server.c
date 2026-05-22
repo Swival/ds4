@@ -4794,6 +4794,23 @@ static bool sse_headers(int fd, bool enable_cors) {
     return ok;
 }
 
+static bool sse_error_event(int fd, const request *r, const char *msg) {
+    const char *message = msg && msg[0] ? msg : "internal server error";
+    buf b = {0};
+    if (r && r->api == API_ANTHROPIC) {
+        buf_puts(&b, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":");
+        json_escape(&b, message);
+        buf_puts(&b, "}}\n\n");
+    } else {
+        buf_puts(&b, "event: error\ndata: {\"error\":{\"message\":");
+        json_escape(&b, message);
+        buf_puts(&b, ",\"type\":\"server_error\"}}\n\n");
+    }
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
 static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
     buf b = {0};
     long now = (long)time(NULL);
@@ -9188,6 +9205,16 @@ typedef struct {
     double last_t;
     int last_current;
     bool seen;
+    /* SSE keepalive during long prefill: send HTTP/SSE headers ahead of
+     * generation and emit a `:` comment line every few seconds so HTTP/TCP
+     * idle timeouts on the client side don't close the connection while the
+     * server is busy doing prefill. */
+    int fd;
+    bool stream;
+    bool enable_cors;
+    bool headers_sent;
+    bool stream_failed;
+    double last_keepalive;
 } server_prefill_progress;
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
@@ -9322,6 +9349,29 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (!p || !event || strcmp(event, "prefill_chunk")) return;
 
     double now = now_sec();
+    /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
+     * response headers the first time the callback fires and then emit a
+     * comment line (`:` prefix, ignored by SSE clients) every few seconds.
+     * Best-effort: if the client has already gone away, the writes fail
+     * silently and the outer code will discover the closed socket the next
+     * time it tries to stream a real event. */
+    if (p->stream && p->fd >= 0 && !p->stream_failed) {
+        if (!p->headers_sent) {
+            p->headers_sent = true;
+            if (sse_headers(p->fd, p->enable_cors)) {
+                p->last_keepalive = now;
+            } else {
+                p->stream_failed = true;
+            }
+        } else if (now - p->last_keepalive >= 5.0) {
+            static const char ka[] = ": prefill\n\n";
+            if (send_all(p->fd, ka, sizeof(ka) - 1)) {
+                p->last_keepalive = now;
+            } else {
+                p->stream_failed = true;
+            }
+        }
+    }
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && current > p->cached_tokens) {
@@ -9368,6 +9418,30 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (p->srv && current > p->cached_tokens) {
         kv_cache_maybe_store_continued(p->srv);
     }
+}
+
+static void send_prefill_failure_response(server *s, const job *j,
+                                          const server_prefill_progress *progress,
+                                          const char *ctx, const char *flags,
+                                          const char *err) {
+    const char *kind = j->req.kind == REQ_CHAT ? "chat" : "completion";
+    if (j->req.stream && progress && progress->headers_sent) {
+        if (progress->stream_failed) {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: %s ctx=%s%s%s prefill failed after stream closed: %s",
+                       kind, ctx, flags && flags[0] ? " " : "",
+                       flags && flags[0] ? flags : "", err);
+            return;
+        }
+        if (!sse_error_event(j->fd, &j->req, err)) {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: %s ctx=%s%s%s prefill SSE error failed: %s",
+                       kind, ctx, flags && flags[0] ? " " : "",
+                       flags && flags[0] ? flags : "", err);
+        }
+        return;
+    }
+    http_error(j->fd, s->enable_cors, 500, err);
 }
 
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
@@ -9555,6 +9629,14 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
             .phase = "tool checkpoint rebuild",
             .has_tools = j->req.has_tools,
             .t0 = rebuild_t0,
+            .fd = j->fd,
+            .stream = j->req.stream,
+            .enable_cors = s->enable_cors,
+            /* Tool checkpoint rebuild only runs after the response stream is
+             * already in flight, so the SSE headers were sent long ago.
+             * Pre-arm the flag so the progress callback only emits keepalive
+             * comments and never tries to write a second set of headers. */
+            .headers_sent = true,
         };
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(s->session, server_progress_cb, &rebuild_progress);
@@ -9774,6 +9856,9 @@ static void generate_job(server *s, job *j) {
         .has_tools = j->req.has_tools,
         .responses_protocol = responses_protocol,
         .t0 = t0,
+        .fd = j->fd,
+        .stream = j->req.stream,
+        .enable_cors = s->enable_cors,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
@@ -9861,7 +9946,7 @@ static void generate_job(server *s, job *j) {
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
             trace_event(s, trace_id, "prefill failed: %s", err);
-            http_error(j->fd, s->enable_cors, 500, err);
+            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
         }
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
@@ -9881,7 +9966,7 @@ static void generate_job(server *s, job *j) {
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
         trace_event(s, trace_id, "prefill failed: %s", err);
-        http_error(j->fd, s->enable_cors, 500, err);
+        send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
     }
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
@@ -9920,7 +10005,20 @@ static void generate_job(server *s, job *j) {
     const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
     long responses_created_at = (long)time(NULL);
     if (j->req.stream) {
-        if (!sse_headers(j->fd, s->enable_cors)) {
+        if (progress.stream_failed) {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: %s ctx=%s%s%s stream closed during prefill",
+                       j->req.kind == REQ_CHAT ? "chat" : "completion",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags);
+            ds4_tokens_free(&effective_prompt);
+            return;
+        }
+        /* The prefill progress callback may have already sent the SSE headers
+         * to keep the connection alive during a long prefill. Only emit them
+         * here when prefill never fired (e.g. fully cached prompt). */
+        if (!progress.headers_sent && !sse_headers(j->fd, s->enable_cors)) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s sse headers failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -9930,6 +10028,7 @@ static void generate_job(server *s, job *j) {
             ds4_tokens_free(&effective_prompt);
             return;
         }
+        progress.headers_sent = true;
         if (j->req.api == API_ANTHROPIC &&
             !anthropic_sse_start_live(j->fd, &j->req, id,
                                       prompt_tokens, &anthropic_live)) {
